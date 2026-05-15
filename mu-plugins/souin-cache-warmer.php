@@ -5,7 +5,8 @@
  *              affected URLs from Souin's cache via its admin API (port 2019).
  *              Only the updated page + its archives/categories are cleared —
  *              the full cache is never wiped, so unrelated pages stay warm.
- * Version:     2.0.0
+ *              Also purges Cloudflare edge cache when CF integration is enabled.
+ * Version:     2.1.0
  * Author:      Code Agency
  */
 
@@ -52,7 +53,7 @@ function _souin_delete_paths( array $urls ): void {
 }
 
 /**
- * Purge ALL cached entries. Used only for site-wide changes
+ * Purge ALL cached entries from Souin. Used only for site-wide changes
  * (theme switch, plugin update, bulk import).
  */
 function _souin_delete_all(): void {
@@ -92,9 +93,90 @@ function _souin_enqueue_warmer(): void {
     }
 }
 
+// ── Cloudflare edge cache purge ───────────────────────────────────────────────
+
+/**
+ * Purge specific absolute URLs from Cloudflare's edge cache.
+ * Reads souin_cf_enabled / souin_cf_zone_id / souin_cf_api_token from WP options.
+ * No-ops when CF integration is disabled or credentials are missing.
+ */
+function _souin_cf_purge_urls( array $urls ): void {
+    if ( ! function_exists( 'get_option' ) || ! get_option( 'souin_cf_enabled' ) ) {
+        return;
+    }
+
+    $zone_id = (string) get_option( 'souin_cf_zone_id', '' );
+    $token   = (string) get_option( 'souin_cf_api_token', '' );
+
+    if ( $zone_id === '' || $token === '' ) {
+        return;
+    }
+
+    $urls = array_values( array_filter( $urls, static fn( $u ) => str_starts_with( (string) $u, 'http' ) ) );
+    if ( empty( $urls ) ) {
+        return;
+    }
+
+    foreach ( array_chunk( $urls, 30 ) as $chunk ) {
+        _souin_cf_api_request( $zone_id, $token, [ 'files' => $chunk ] );
+    }
+}
+
+/**
+ * Purge the entire Cloudflare edge cache for this zone.
+ * Only for site-wide changes — never call on single product updates.
+ */
+function _souin_cf_purge_all(): void {
+    if ( ! function_exists( 'get_option' ) || ! get_option( 'souin_cf_enabled' ) ) {
+        return;
+    }
+
+    $zone_id = (string) get_option( 'souin_cf_zone_id', '' );
+    $token   = (string) get_option( 'souin_cf_api_token', '' );
+
+    if ( $zone_id === '' || $token === '' ) {
+        return;
+    }
+
+    _souin_cf_api_request( $zone_id, $token, [ 'purge_everything' => true ] );
+}
+
+/**
+ * Send a POST to the Cloudflare Cache Purge API.
+ * 5-second timeout — never blocks a visitor request.
+ */
+function _souin_cf_api_request( string $zone_id, string $token, array $body ): void {
+    $ch = curl_init( 'https://api.cloudflare.com/client/v4/zones/' . $zone_id . '/purge_cache' );
+    curl_setopt_array( $ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_TIMEOUT        => 5,
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $token,
+            'Content-Type: application/json',
+        ],
+        CURLOPT_POSTFIELDS => json_encode( $body ),
+    ] );
+    $response = curl_exec( $ch );
+    $errno    = curl_errno( $ch );
+    curl_close( $ch );
+
+    if ( $errno ) {
+        error_log( '[Souin Cache Warmer] CF purge curl error ' . $errno );
+    } elseif ( $response ) {
+        $decoded = json_decode( $response, true );
+        if ( isset( $decoded['success'] ) && ! $decoded['success'] ) {
+            error_log( '[Souin Cache Warmer] CF purge API error: ' . json_encode( $decoded['errors'] ?? [] ) );
+        }
+    }
+}
+
+// ── Per-post/product surgical invalidation ───────────────────────────────────
+
 /**
  * Surgical cache invalidation for a single post/product.
- * Clears the permalink + related archives, categories, shop, and home page.
+ * Clears the permalink + related archives, categories, shop, and home page
+ * from both Souin (port 2019 admin API) and Cloudflare edge (when enabled).
  */
 function _souin_purge_post( int $post_id ): void {
     static $purged = [];
@@ -134,10 +216,10 @@ function _souin_purge_post( int $post_id ): void {
 
     $urls[] = home_url( '/' );
 
-    _souin_delete_paths( array_unique( $urls ) );
+    $urls = array_unique( $urls );
+    _souin_delete_paths( $urls );
+    _souin_cf_purge_urls( $urls );
 }
-
-// ── Per-post/product surgical invalidation ───────────────────────────────────
 
 add_action( 'save_post', static function ( int $id, \WP_Post $post ): void {
     if ( in_array( $post->post_status, [ 'publish', 'future' ], true ) ) {
@@ -164,6 +246,7 @@ add_action( 'woocommerce_product_set_stock_status', static function ( $product_i
 function _souin_full_purge_and_warm(): void {
     _souin_delete_all();
     _souin_enqueue_warmer();
+    _souin_cf_purge_all();
 }
 
 add_action( 'wp_update_nav_menu',        '_souin_full_purge_and_warm' );
