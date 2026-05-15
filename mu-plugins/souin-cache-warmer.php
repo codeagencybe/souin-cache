@@ -1,134 +1,174 @@
 <?php
 /**
- * Plugin Name: Souin Cache Warmer (must-use companion)
- * Description: On WordPress content changes, PURGE the entire Souin response
- *              cache via its management API and push a marker to a Redis list
- *              so an external warmer can repopulate the cache by crawling the
- *              sitemap. Companion to the Souin Cache Purger plugin.
- * Version:     1.0.0
+ * Plugin Name: Souin Cache Invalidator
+ * Description: On WordPress/WooCommerce content changes, surgically DELETE the
+ *              affected URLs from Souin's cache via its admin API (port 2019).
+ *              Only the updated page + its archives/categories are cleared —
+ *              the full cache is never wiped, so unrelated pages stay warm.
+ * Version:     2.0.0
  * Author:      Code Agency
- * Author URI:  https://codeagency.be
- *
- * Installation: drop this file into wp-content/mu-plugins/. mu-plugins are
- * auto-loaded by WordPress and cannot be deactivated from the admin UI.
- *
- * --------------------------------------------------------------------------
- * Why a separate mu-plugin instead of putting this in the regular plugin?
- * --------------------------------------------------------------------------
- *
- * The regular souin-cache plugin does *surgical* invalidation: it deletes
- * Redis keys for the URLs related to the post that changed (permalink,
- * archives, feed, etc.). That works well when Souin's own TTL is short and
- * gradual cache miss is acceptable.
- *
- * This mu-plugin implements an alternative strategy: long Souin TTL (days /
- * weeks) and full-cache invalidation on every content change, paired with an
- * external warmer that re-populates the cache from the sitemap. The cache is
- * effectively "always-warm" — visitors never see a cold page after a cache
- * eviction, only after deliberate purges.
- *
- * The two strategies can also coexist (defense in depth). The regular plugin
- * deletes specific URL keys directly via Redis SCAN+DEL; this mu-plugin
- * additionally calls Souin's management API which knows about Souin-specific
- * key shapes (IDX_*, vary headers, response/request key pairs).
- *
- * --------------------------------------------------------------------------
- * Configuration (set in wp-config.php BEFORE wp-settings.php is included)
- * --------------------------------------------------------------------------
- *
- *   define( 'WP_REDIS_HOST',     'redis.example.com' );      // required
- *   define( 'WP_REDIS_PASSWORD', 'your-password-here' );     // required
- *   define( 'WP_REDIS_PORT',     6379 );                     // optional
- *   define( 'SOUIN_API_URL',
- *       'http://127.0.0.1/souin-api/souin/?path=.%2B' );     // optional, default shown
- *   define( 'SOUIN_WARMER_QUEUE', 'wp:cache-warm-queue' );   // optional, default shown
- *
- * --------------------------------------------------------------------------
- * Caddyfile prerequisites
- * --------------------------------------------------------------------------
- *
- *   - Souin's management API must be mounted (typically at /souin-api/*).
- *   - The API must be firewalled to 127.0.0.1 so it cannot be invoked from
- *     the public internet (anyone could PURGE your entire cache otherwise).
- *     This mu-plugin runs inside the same pod/host as Caddy, so a localhost
- *     call works.
- *
- * --------------------------------------------------------------------------
- * Notes
- * --------------------------------------------------------------------------
- *
- *   - wp_cache_flush is NOT hooked. The Redis object-cache drop-in (used by
- *     plugins like redis-cache) overrides wp_cache_flush() at the function
- *     level, which means the action hook never fires. Hooking it here would
- *     be a no-op.
- *   - The static $done guard deduplicates within a single request so bulk
- *     imports / mass updates only trigger one PURGE+RPUSH.
- *   - All errors are swallowed silently — cache warming should never break
- *     a visitor request.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
-	exit;
+    exit;
 }
 
-if ( ! defined( 'WP_REDIS_HOST' ) || ! defined( 'WP_REDIS_PASSWORD' ) ) {
-	return;
-}
-
-if ( ! defined( 'SOUIN_API_URL' ) ) {
-	define( 'SOUIN_API_URL', 'http://127.0.0.1/souin-api/souin/?path=.%2B' );
+if ( ! defined( 'SOUIN_ADMIN_URL' ) ) {
+    define( 'SOUIN_ADMIN_URL', 'http://127.0.0.1:2019/souin-api/souin' );
 }
 
 if ( ! defined( 'SOUIN_WARMER_QUEUE' ) ) {
-	define( 'SOUIN_WARMER_QUEUE', 'wp:cache-warm-queue' );
+    define( 'SOUIN_WARMER_QUEUE', 'wp:cache-warm-queue' );
 }
 
-function _souin_cache_purge_all(): void {
-	$ch = curl_init( SOUIN_API_URL );
-	curl_setopt( $ch, CURLOPT_CUSTOMREQUEST, 'PURGE' );
-	curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
-	curl_setopt( $ch, CURLOPT_TIMEOUT,        2 );
-	curl_setopt( $ch, CURLOPT_NOBODY,         true );
-	curl_exec( $ch );
-	curl_close( $ch );
+/**
+ * DELETE one or more URL paths from Souin using a regex pattern.
+ * Uses the Caddy admin API on port 2019 — never touches port 80.
+ */
+function _souin_delete_paths( array $urls ): void {
+    if ( empty( $urls ) ) {
+        return;
+    }
+
+    $paths = array_filter( array_map( static function ( $url ) {
+        $p = parse_url( $url, PHP_URL_PATH );
+        return $p ? preg_quote( $p, '/' ) : null;
+    }, $urls ) );
+
+    if ( empty( $paths ) ) {
+        return;
+    }
+
+    $pattern = count( $paths ) === 1
+        ? '^' . reset( $paths ) . '($|\?)'
+        : '^(' . implode( '|', $paths ) . ')($|\?)';
+
+    $ch = curl_init( SOUIN_ADMIN_URL . '?path=' . rawurlencode( $pattern ) );
+    curl_setopt( $ch, CURLOPT_CUSTOMREQUEST, 'DELETE' );
+    curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+    curl_setopt( $ch, CURLOPT_TIMEOUT, 3 );
+    curl_exec( $ch );
+    curl_close( $ch );
 }
 
-function _souin_cache_warmer_enqueue(): void {
-	static $done = false;
-	if ( $done ) {
-		return;
-	}
-	$done = true;
-
-	_souin_cache_purge_all();
-
-	try {
-		$r = new Redis();
-		$r->connect( WP_REDIS_HOST, defined( 'WP_REDIS_PORT' ) ? (int) WP_REDIS_PORT : 6379 );
-		$r->auth( WP_REDIS_PASSWORD );
-		// Only enqueue if nothing is already pending — deduplicates bursts.
-		if ( (int) $r->lLen( SOUIN_WARMER_QUEUE ) === 0 ) {
-			$r->rPush( SOUIN_WARMER_QUEUE, (string) time() );
-			$r->expire( SOUIN_WARMER_QUEUE, 3600 );
-		}
-	} catch ( \Throwable $e ) {
-		// Never break a visitor request over cache warming.
-	}
+/**
+ * Purge ALL cached entries. Used only for site-wide changes
+ * (theme switch, plugin update, bulk import).
+ */
+function _souin_delete_all(): void {
+    $ch = curl_init( SOUIN_ADMIN_URL . '?path=.%2B' );
+    curl_setopt( $ch, CURLOPT_CUSTOMREQUEST, 'DELETE' );
+    curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+    curl_setopt( $ch, CURLOPT_TIMEOUT, 3 );
+    curl_exec( $ch );
+    curl_close( $ch );
 }
 
-// WordPress core events for ANY post type (post, page, product, etc.)
+/**
+ * Enqueue the cache warmer for a full site re-warm.
+ * Only used after full purges (plugin/theme changes).
+ */
+function _souin_enqueue_warmer(): void {
+    static $done = false;
+    if ( $done ) {
+        return;
+    }
+    $done = true;
+
+    if ( ! defined( 'WP_REDIS_HOST' ) || ! defined( 'WP_REDIS_PASSWORD' ) ) {
+        return;
+    }
+
+    try {
+        $r = new Redis();
+        $r->connect( WP_REDIS_HOST, defined( 'WP_REDIS_PORT' ) ? (int) WP_REDIS_PORT : 6379 );
+        $r->auth( WP_REDIS_PASSWORD );
+        if ( (int) $r->lLen( SOUIN_WARMER_QUEUE ) === 0 ) {
+            $r->rPush( SOUIN_WARMER_QUEUE, (string) time() );
+            $r->expire( SOUIN_WARMER_QUEUE, 3600 );
+        }
+    } catch ( \Throwable $e ) {
+        // Never break a visitor request over cache warming.
+    }
+}
+
+/**
+ * Surgical cache invalidation for a single post/product.
+ * Clears the permalink + related archives, categories, shop, and home page.
+ */
+function _souin_purge_post( int $post_id ): void {
+    static $purged = [];
+    if ( isset( $purged[ $post_id ] ) ) {
+        return;
+    }
+    $purged[ $post_id ] = true;
+
+    $post = get_post( $post_id );
+    if ( ! $post || ! in_array( $post->post_status, [ 'publish', 'future' ], true ) ) {
+        return;
+    }
+
+    $urls = [];
+
+    $permalink = get_permalink( $post_id );
+    if ( $permalink ) {
+        $urls[] = $permalink;
+    }
+
+    if ( 'product' === $post->post_type ) {
+        $shop_id = wc_get_page_id( 'shop' );
+        if ( $shop_id ) {
+            $urls[] = get_permalink( $shop_id );
+        }
+
+        $cats = get_the_terms( $post_id, 'product_cat' );
+        if ( $cats && ! is_wp_error( $cats ) ) {
+            foreach ( $cats as $cat ) {
+                $cat_link = get_term_link( $cat );
+                if ( ! is_wp_error( $cat_link ) ) {
+                    $urls[] = $cat_link;
+                }
+            }
+        }
+    }
+
+    $urls[] = home_url( '/' );
+
+    _souin_delete_paths( array_unique( $urls ) );
+}
+
+// ── Per-post/product surgical invalidation ───────────────────────────────────
+
 add_action( 'save_post', static function ( int $id, \WP_Post $post ): void {
-	if ( in_array( $post->post_status, [ 'publish', 'future' ], true ) ) {
-		_souin_cache_warmer_enqueue();
-	}
+    if ( in_array( $post->post_status, [ 'publish', 'future' ], true ) ) {
+        _souin_purge_post( $id );
+    }
 }, 10, 2 );
-add_action( 'delete_post',          '_souin_cache_warmer_enqueue' );
-add_action( 'wp_update_nav_menu',   '_souin_cache_warmer_enqueue' );
-add_action( 'switch_theme',         '_souin_cache_warmer_enqueue' );
-add_action( 'customize_save_after', '_souin_cache_warmer_enqueue' );
 
-// WooCommerce stock and product changes.
-add_action( 'woocommerce_update_product',            '_souin_cache_warmer_enqueue' );
-add_action( 'woocommerce_product_set_stock',         '_souin_cache_warmer_enqueue' );
-add_action( 'woocommerce_product_set_stock_status',  '_souin_cache_warmer_enqueue' );
-add_action( 'woocommerce_variation_set_stock',       '_souin_cache_warmer_enqueue' );
+add_action( 'delete_post', static function ( int $id ): void {
+    _souin_purge_post( $id );
+} );
+
+add_action( 'woocommerce_update_product', '_souin_purge_post' );
+add_action( 'woocommerce_product_set_stock', static function ( $product ): void {
+    if ( is_object( $product ) && method_exists( $product, 'get_id' ) ) {
+        _souin_purge_post( $product->get_id() );
+    }
+} );
+add_action( 'woocommerce_product_set_stock_status', static function ( $product_id ): void {
+    _souin_purge_post( (int) $product_id );
+} );
+
+// ── Full-purge + warmer for site-wide changes ─────────────────────────────────
+
+function _souin_full_purge_and_warm(): void {
+    _souin_delete_all();
+    _souin_enqueue_warmer();
+}
+
+add_action( 'wp_update_nav_menu',        '_souin_full_purge_and_warm' );
+add_action( 'switch_theme',              '_souin_full_purge_and_warm' );
+add_action( 'customize_save_after',      '_souin_full_purge_and_warm' );
+add_action( 'activated_plugin',          '_souin_full_purge_and_warm' );
+add_action( 'deactivated_plugin',        '_souin_full_purge_and_warm' );
+add_action( 'upgrader_process_complete', '_souin_full_purge_and_warm' );
