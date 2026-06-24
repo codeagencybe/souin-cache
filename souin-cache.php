@@ -2,7 +2,7 @@
 /**
  * Plugin Name:  Souin Cache Purger
  * Description:  Purges Souin HTTP cache on WordPress content updates. Sends HTTP PURGE requests to the Souin middleware running in the same FrankenPHP pod.
- * Version:      1.0.0
+ * Version:      1.1.0
  * Author:       Code Agency
  * Author URI:   https://codeagency.be
  * License:      GPL-2.0+
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'SOUIN_CACHE_VERSION', '1.0.0' );
+define( 'SOUIN_CACHE_VERSION', '1.1.0' );
 define( 'SOUIN_CACHE_DIR', plugin_dir_path( __FILE__ ) );
 
 require_once SOUIN_CACHE_DIR . 'includes/class-purger.php';

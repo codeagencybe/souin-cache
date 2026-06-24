@@ -46,6 +46,8 @@ class Souin_Cache_Purger {
 		foreach ( $urls as $url ) {
 			$this->purge_url( $url );
 		}
+
+		$this->cf_purge_urls( $urls );
 	}
 
 	public function on_woo_product( $product ) {
@@ -59,6 +61,8 @@ class Souin_Cache_Purger {
 		$host = wp_parse_url( home_url(), PHP_URL_HOST );
 		// Souin keys: GET-http-{host}-{path}, HEAD-http-{host}-{path}, IDX_*-http-{host}-{path}
 		$this->redis_scan_delete( '*-http-' . $host . '-*' );
+
+		$this->cf_purge_all();
 	}
 
 	// -------------------------------------------------------------------------
@@ -183,5 +187,87 @@ class Souin_Cache_Purger {
 			(int) ( $parts[1] ?? 6379 ),
 			(string) $password,
 		];
+	}
+
+	// -------------------------------------------------------------------------
+	// Cloudflare edge cache purge
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Purges specific absolute URLs from Cloudflare's edge cache.
+	 * CF accepts a maximum of 30 URLs per API request.
+	 * No-ops when CF integration is disabled or credentials are missing.
+	 */
+	public function cf_purge_urls( array $urls ): void {
+		if ( ! get_option( 'souin_cf_enabled' ) ) {
+			return;
+		}
+
+		$zone_id = (string) get_option( 'souin_cf_zone_id', '' );
+		$token   = (string) get_option( 'souin_cf_api_token', '' );
+
+		if ( $zone_id === '' || $token === '' ) {
+			return;
+		}
+
+		$urls = array_values( array_filter( $urls, static fn( $u ) => str_starts_with( $u, 'http' ) ) );
+
+		if ( empty( $urls ) ) {
+			return;
+		}
+
+		foreach ( array_chunk( $urls, 30 ) as $chunk ) {
+			$this->cf_api_request( $zone_id, $token, [ 'files' => $chunk ] );
+		}
+	}
+
+	/**
+	 * Purges the entire Cloudflare edge cache for this zone.
+	 * Only used for site-wide changes (theme switch, nav menu update, etc.).
+	 */
+	public function cf_purge_all(): void {
+		if ( ! get_option( 'souin_cf_enabled' ) ) {
+			return;
+		}
+
+		$zone_id = (string) get_option( 'souin_cf_zone_id', '' );
+		$token   = (string) get_option( 'souin_cf_api_token', '' );
+
+		if ( $zone_id === '' || $token === '' ) {
+			return;
+		}
+
+		$this->cf_api_request( $zone_id, $token, [ 'purge_everything' => true ] );
+	}
+
+	/**
+	 * Sends a POST request to the Cloudflare Cache Purge API.
+	 * Times out after 5 seconds — never blocks a visitor request.
+	 */
+	private function cf_api_request( string $zone_id, string $token, array $body ): void {
+		$ch = curl_init( 'https://api.cloudflare.com/client/v4/zones/' . $zone_id . '/purge_cache' );
+		curl_setopt_array( $ch, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_POST           => true,
+			CURLOPT_TIMEOUT        => 5,
+			CURLOPT_HTTPHEADER     => [
+				'Authorization: Bearer ' . $token,
+				'Content-Type: application/json',
+			],
+			CURLOPT_POSTFIELDS => wp_json_encode( $body ),
+		] );
+		$response = curl_exec( $ch );
+		$errno    = curl_errno( $ch );
+		curl_close( $ch );
+
+		if ( $errno ) {
+			error_log( '[Souin Cache] CF purge curl error ' . $errno );
+		} elseif ( $response ) {
+			$decoded = json_decode( $response, true );
+			if ( isset( $decoded['success'] ) && ! $decoded['success'] ) {
+				$msg = wp_json_encode( $decoded['errors'] ?? [] );
+				error_log( '[Souin Cache] CF purge API error: ' . $msg );
+			}
+		}
 	}
 }

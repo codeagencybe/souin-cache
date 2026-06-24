@@ -11,6 +11,7 @@ class Souin_Cache_Admin {
 		add_action( 'admin_init',         [ $this, 'register_settings' ] );
 		add_action( 'admin_bar_menu',     [ $this, 'add_admin_bar_button' ], 100 );
 		add_action( 'admin_post_souin_purge_all', [ $this, 'handle_manual_purge' ] );
+		add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_settings_scripts' ] );
 	}
 
 	// -------------------------------------------------------------------------
@@ -45,6 +46,28 @@ class Souin_Cache_Admin {
 			'sanitize_callback' => [ $this, 'sanitize_excludes' ],
 			'default'           => '',
 		] );
+
+		// ── Cloudflare settings ───────────────────────────────────────────────
+
+		register_setting( 'souin_cache', 'souin_cf_enabled', [
+			'type'              => 'boolean',
+			'sanitize_callback' => 'rest_sanitize_boolean',
+			'default'           => false,
+		] );
+
+		register_setting( 'souin_cache', 'souin_cf_zone_id', [
+			'type'              => 'string',
+			'sanitize_callback' => 'sanitize_text_field',
+			'default'           => '',
+		] );
+
+		register_setting( 'souin_cache', 'souin_cf_api_token', [
+			'type'              => 'string',
+			'sanitize_callback' => 'sanitize_text_field',
+			'default'           => '',
+		] );
+
+		// ── Sections ──────────────────────────────────────────────────────────
 
 		add_settings_section( 'souin_cache_main', 'Redis Connection', '__return_false', 'souin-cache' );
 
@@ -87,6 +110,78 @@ class Souin_Cache_Admin {
 			'souin-cache',
 			'souin_cache_excludes_section'
 		);
+
+		// ── Cloudflare section ────────────────────────────────────────────────
+
+		add_settings_section(
+			'souin_cache_cf',
+			'Cloudflare Integration',
+			function () {
+				echo '<p>When enabled, updated pages are also purged from the Cloudflare edge cache immediately — so visitors never see stale content even with a long CF edge TTL.</p>';
+			},
+			'souin-cache'
+		);
+
+		add_settings_field(
+			'souin_cf_enabled',
+			'Enable Cloudflare purge',
+			function () {
+				$enabled = (bool) get_option( 'souin_cf_enabled', false );
+				echo '<label>';
+				echo '<input type="checkbox" name="souin_cf_enabled" value="1" id="souin_cf_enabled" ' . checked( $enabled, true, false ) . ' />';
+				echo ' Purge Cloudflare edge cache on content changes';
+				echo '</label>';
+				echo '<p class="description">Requires a Cloudflare API token with the <em>Cache Purge</em> permission.</p>';
+			},
+			'souin-cache',
+			'souin_cache_cf'
+		);
+
+		add_settings_field(
+			'souin_cf_zone_id',
+			'Zone ID',
+			function () {
+				$value = get_option( 'souin_cf_zone_id', '' );
+				echo '<input type="text" name="souin_cf_zone_id" value="' . esc_attr( $value ) . '" class="regular-text souin-cf-dependent" placeholder="e.g. 023e105f4ecef8ad9ca31a8372d0c353" />';
+				echo '<p class="description souin-cf-dependent">Found in your Cloudflare dashboard under <strong>Overview → Zone ID</strong> (right sidebar).</p>';
+			},
+			'souin-cache',
+			'souin_cache_cf'
+		);
+
+		add_settings_field(
+			'souin_cf_api_token',
+			'API Token',
+			function () {
+				$value = get_option( 'souin_cf_api_token', '' );
+				echo '<input type="password" name="souin_cf_api_token" value="' . esc_attr( $value ) . '" class="regular-text souin-cf-dependent" autocomplete="new-password" />';
+				echo '<p class="description souin-cf-dependent">Create a token at <strong>My Profile → API Tokens → Create Token</strong>. Use the <em>Cache Purge</em> template and restrict it to this zone only.</p>';
+			},
+			'souin-cache',
+			'souin_cache_cf'
+		);
+	}
+
+	public function enqueue_settings_scripts( string $hook ): void {
+		if ( $hook !== 'settings_page_souin-cache' ) {
+			return;
+		}
+		wp_add_inline_script( 'jquery', "
+			document.addEventListener('DOMContentLoaded', function () {
+				var checkbox = document.getElementById('souin_cf_enabled');
+				if ( ! checkbox ) return;
+
+				function toggleCfFields() {
+					document.querySelectorAll('.souin-cf-dependent').forEach(function (el) {
+						var tr = el.closest('tr');
+						if ( tr ) tr.style.display = checkbox.checked ? '' : 'none';
+					});
+				}
+
+				checkbox.addEventListener('change', toggleCfFields);
+				toggleCfFields();
+			});
+		" );
 	}
 
 	public function sanitize_excludes( $val ): string {
