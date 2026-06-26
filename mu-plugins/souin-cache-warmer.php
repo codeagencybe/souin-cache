@@ -53,6 +53,21 @@ function _souin_delete_paths( array $urls ): void {
 }
 
 /**
+ * Purge all sitemap URLs from Souin.
+ * Sitemaps are now cached by Souin (not excluded), so they must be
+ * explicitly invalidated whenever content changes so crawlers and the
+ * cache warmer always see an up-to-date URL list.
+ */
+function _souin_delete_sitemaps(): void {
+    $ch = curl_init( SOUIN_ADMIN_URL . '?path=' . rawurlencode( '/(wp-sitemap|sitemap[^/]*\.xml|sitemap_index\.xml)' ) );
+    curl_setopt( $ch, CURLOPT_CUSTOMREQUEST, 'DELETE' );
+    curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+    curl_setopt( $ch, CURLOPT_TIMEOUT, 3 );
+    curl_exec( $ch );
+    curl_close( $ch );
+}
+
+/**
  * Purge ALL cached entries from Souin. Used only for site-wide changes
  * (theme switch, plugin update, bulk import).
  */
@@ -218,6 +233,9 @@ function _souin_purge_post( int $post_id ): void {
 
     $urls = array_unique( $urls );
     _souin_delete_paths( $urls );
+    // Sitemaps are cached by Souin and must be invalidated on every content
+    // change so crawlers and the cache warmer see the current URL list.
+    _souin_delete_sitemaps();
     _souin_cf_purge_urls( $urls );
 }
 
